@@ -1,0 +1,241 @@
+---
+title: "Oakland Ballers Pitch Reclassification Model"
+author: "Riley Elliott
+output: html_document
+date: "2024-09-19"
+---
+
+```{r}
+library(dplyr)
+library(cluster)
+library(factoextra)
+library(readr)
+```
+
+
+Data preprocessing--provides preliminary tags to untagged pitches, makes naming conventions consistent. 
+
+```{r}
+# Function to update the CSV with corrections
+update_csv <- function(input_file, output_file) {
+  # Read the CSV file
+  data <- read.csv(input_file, stringsAsFactors = FALSE)
+  
+  # Replace "Undefined" or "Other" in "TaggedPitchType" with the value from "AutoPitchType"
+  data <- data %>%
+    mutate(TaggedPitchType = ifelse(TaggedPitchType %in% c("Undefined", "Other", "Fastball"), AutoPitchType, TaggedPitchType))
+  
+  # Replace specific pitch types in the specified columns
+  replace_pitch_types <- function(df, columns) {
+    for (column in columns) {
+      df[[column]] <- gsub("Four-Seam", "FourSeamFastBall", df[[column]])
+      df[[column]] <- gsub("Changeup", "ChangeUp", df[[column]])
+      df[[column]] <- gsub("TwoSeamFastBall", "Sinker", df[[column]])
+      df[[column]] <- gsub("OneSeamFastBall", "Sinker", df[[column]])
+    }
+    return(df)
+  }
+  
+  columns_to_replace <- c("TaggedPitchType", "AutoPitchType")
+  data <- replace_pitch_types(data, columns_to_replace)
+  
+  # Replace NA with empty strings
+  data[is.na(data)] <- ""
+  
+  # Manually quote specific columns
+  quote_columns <- function(df, columns) {
+    for (column in columns) {
+      df[[column]] <- paste0('"', df[[column]], '"')
+    }
+    return(df)
+  }
+  
+  columns_to_quote <- c("Pitcher", "Batter", "Catcher")
+  data <- quote_columns(data, columns_to_quote)
+  
+  # Write the updated data back to a CSV file without double quotes around other cells
+  write.table(data, output_file, row.names = FALSE, sep = ",", quote = FALSE, na = "", col.names = TRUE)
+}
+
+# Example usage
+input_file <- "/Users/relliott/Desktop/Ballers Analytics/BallersCode/venv/csvs/yhwpreseries.csv"
+output_file <- "/Users/relliott/Desktop/Ballers Analytics/BallersCode/venv/csvs/yhwpreseries2.csv"
+
+update_csv(input_file, output_file)
+```
+
+
+Pitch reclassification model
+
+```{r}
+# Calculate average silhouette width
+calculate_silhouette <- function(data, min_k, max_k) {
+  silhouette_width <- sapply(min_k:max_k, function(k) {
+    pam_res <- pam(data, k)
+    silhouette_score <- silhouette(pam_res$clustering, dist(data))
+    mean(silhouette_score[, 3])
+  })
+  return(c(rep(NA, min_k - 1), silhouette_width))
+}
+
+# Convert columns to numeric and handle non-numeric values
+convert_to_numeric <- function(df, columns) {
+  for (col in columns) {
+    df[[col]] <- as.numeric(df[[col]])
+    if (any(is.na(df[[col]]))) {
+      warning(paste("Non-numeric values found in column:", col))
+      df <- df %>% filter(!is.na(df[[col]]))
+    }
+  }
+  return(df)
+}
+
+# Calculate weights based on variance explained
+calculate_weights <- function(data, columns) {
+  variances <- sapply(data[columns], var, na.rm = TRUE)
+  total_variance <- sum(variances)
+  explained_variance <- variances / total_variance
+  weights <- explained_variance * 2.5 + 0.5 # Set a range
+  return(weights)
+}
+
+# Pitch type reclassification model
+classify_pitch_types <- function(input_file, output_file, min_k = 6, max_k = 8) {
+  # Read the input CSV file with specified column types
+  data <- read_csv(input_file, col_types = cols(
+    .default = col_character(),
+    RelSpeed = col_double(),
+    SpinRate = col_double(),
+    InducedVertBreak = col_double(),
+    HorzBreak = col_double()
+  ))
+
+  # Check for parsing issues
+  if (any(problems(data))) {
+    print(problems(data))
+    stop("Parsing issues detected.")
+  }
+
+  # Ensure TaggedPitchType is present
+  if (!"TaggedPitchType" %in% names(data)) {
+    stop("TaggedPitchType column not found in the input data")
+  }
+
+  # Define fastball group and weights
+  fastball_types <- c("Fastball", "FourSeamFastBall", "TwoSeamFastBall", "Sinker", "Cutter")
+  weights_fastball <- list(RelSpeed = 1.0, SpinRate = 1.2, InducedVertBreak = 2.4, HorzBreak = 2)
+
+  # Add a unique identifier for each row and preserve the original order
+  data <- data %>% mutate(PitchID = row_number(), OriginalOrder = row_number())
+
+  # Compile a list of unique pitcher names
+  unique_pitchers <- unique(data$Pitcher)
+
+  # Initialize an empty data frame to store the results
+  updated_data <- data.frame(stringsAsFactors = FALSE)
+
+  # Loop through each unique pitcher
+  for (pitcher in unique_pitchers) {
+    # Subset data for the current pitcher and filter out rows without pitch tags or metrics
+    pitcher_data <- data %>% filter(Pitcher == pitcher, TaggedPitchType != "", RelSpeed != "" & SpinRate != "" & InducedVertBreak != "" & HorzBreak != "")
+
+    # Convert relevant columns to numeric and handle non-numeric values
+    pitcher_data <- convert_to_numeric(pitcher_data, c("RelSpeed", "SpinRate", "InducedVertBreak", "HorzBreak"))
+
+    # Skip if the pitcher has thrown < 10 pitches after filtering
+    if (nrow(pitcher_data) < 10) {
+      next
+    }
+
+    # Z-score normalization for specified columns
+    normalized_data <- pitcher_data %>%
+      mutate(
+        RelSpeed_z = scale(RelSpeed, center = TRUE, scale = TRUE),
+        SpinRate_z = scale(SpinRate, center = TRUE, scale = TRUE),
+        InducedVertBreak_z = scale(InducedVertBreak, center = TRUE, scale = TRUE),
+        HorzBreak_z = scale(HorzBreak, center = TRUE, scale = TRUE)
+      )
+
+    # Calculate weights for non-fastball pitches based on variance explained
+    non_fastball_data <- normalized_data %>% filter(!TaggedPitchType %in% fastball_types)
+    if (nrow(non_fastball_data) > 1) {
+      weights <- calculate_weights(non_fastball_data, c("RelSpeed_z", "SpinRate_z", "InducedVertBreak_z", "HorzBreak_z"))
+    } else {
+      weights <- c(RelSpeed_z = 1.7, SpinRate_z = 1.2, InducedVertBreak_z = 2.0, HorzBreak_z = 1.9) # Default weights if there is insufficient non-fastball data
+    }
+
+    # Print the weights for each pitcher
+    cat(pitcher, ":\n")
+    for (var in names(weights)) {
+      cat(paste0(var, ": ", weights[var], ",\n"))
+    }
+    cat("\n")
+
+    # Apply weights to normalized data
+    weighted_data <- normalized_data %>%
+      rowwise() %>%
+      mutate(
+        RelSpeed_z = if_else(TaggedPitchType %in% fastball_types, RelSpeed_z * weights_fastball$RelSpeed, RelSpeed_z * weights[1]),
+        SpinRate_z = if_else(TaggedPitchType %in% fastball_types, SpinRate_z * weights_fastball$SpinRate, SpinRate_z * weights[2]),
+        InducedVertBreak_z = if_else(TaggedPitchType %in% fastball_types, InducedVertBreak_z * weights_fastball$InducedVertBreak, InducedVertBreak_z * weights[3]),
+        HorzBreak_z = if_else(TaggedPitchType %in% fastball_types, HorzBreak_z * weights_fastball$HorzBreak, HorzBreak_z * weights[4])
+      ) %>%
+      ungroup()
+
+    # Select only the normalized columns for clustering
+    normalized_matrix <- weighted_data %>%
+      select(RelSpeed_z, SpinRate_z, InducedVertBreak_z, HorzBreak_z) %>%
+      as.matrix()
+
+    # Ensure all normalized columns are numeric
+    if (!all(sapply(normalized_matrix, is.numeric))) {
+      warning("Non-numeric values found after normalization.")
+      next
+    }
+
+    # Calculate silhouette widths only if we have enough data points
+    if (nrow(normalized_matrix) > 1) {
+      silhouette_width <- calculate_silhouette(normalized_matrix, min_k, max_k)
+
+      # Choose the optimal k based on silhouette method
+      optimal_k_silhouette <- which.max(silhouette_width)
+
+      # Perform K-medoids clustering with the optimal k
+      pam_res <- pam(normalized_matrix, k = optimal_k_silhouette)
+
+      # Assign the cluster labels to the data
+      normalized_data$cluster <- pam_res$clustering
+
+      # Retag the pitch types based on the most populous pitch type in each cluster
+      updated_tags <- normalized_data %>%
+        mutate(TaggedPitchType_new = pitcher_data$TaggedPitchType) %>%
+        group_by(cluster) %>%
+        mutate(TaggedPitchType_new = names(which.max(table(TaggedPitchType_new)))) %>%
+        ungroup() %>%
+        select(PitchID, TaggedPitchType_new)
+
+      # Update the original data with new tags
+      updated_pitcher_data <- pitcher_data %>% 
+        left_join(updated_tags, by = "PitchID") %>%
+        mutate(TaggedPitchType = coalesce(TaggedPitchType_new, TaggedPitchType)) %>%
+        select(-TaggedPitchType_new)
+      
+      # Combine the updated data for each pitcher
+      updated_data <- bind_rows(updated_data, updated_pitcher_data)
+    }
+  }
+
+  # Merge the updated TaggedPitchType back to the original data
+  final_data <- data %>%
+    left_join(updated_data %>% select(PitchID, TaggedPitchType), by = "PitchID", suffix = c("", "_new")) %>%
+    mutate(TaggedPitchType = coalesce(TaggedPitchType_new, TaggedPitchType)) %>%
+    select(-TaggedPitchType_new, -PitchID, -OriginalOrder)
+
+  # Write the final data to a CSV file
+  write_csv(final_data, output_file, na = "")
+}
+
+# Call function
+classify_pitch_types("/Users/relliott/Desktop/Ballers Analytics/BallersCode/venv/csvs/yhwpreseries2.csv", "/Users/relliott/Desktop/Ballers Analytics/BallersCode/venv/csvs/yhwpreseries3.csv", min_k = 6, max_k = 8)
+```
+
