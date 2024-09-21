@@ -1,6 +1,6 @@
 ---
 title: "Oakland Ballers Pitch Reclassification Model"
-author: "Riley Elliott
+author: "Riley Elliott"
 output: html_document
 date: "2024-09-19"
 ---
