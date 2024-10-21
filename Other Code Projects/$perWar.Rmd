@@ -1,0 +1,39 @@
+---
+title: "$/WAR Time Series Model"
+output: html_document
+date: "2024-10-04"
+---
+
+```{r setup, include=FALSE}
+library(forecast)
+require(astsa)
+```
+
+
+```{r}
+# Data input from the table (in millions of dollars per WAR)
+data <- c(9.3, 7.8, 9.5, 5.5, 8.5, 4.6, 6.7)
+
+# Create a time series object for the years 2018-2024
+years <- 2018:2024
+war_ts <- ts(data, start = 2018, end = 2024)
+
+acf2(war_ts, max.lag = 6)
+```
+
+
+
+
+```{r}
+# Fit an AR(2) model
+ar_model <- arima(war_ts, order = c(2, 0, 0))
+summary(ar_model)
+
+# Forecast 2025 $/WAR
+forecast_2025 <- forecast(ar_model, h = 1)
+print(forecast_2025)
+
+# Plot
+plot(forecast_2025, main = "AR(2) Forecast for $/WAR on Starter Quality Players, 2025", xlab = "Year", ylab = "$/WAR (in millions)")
+```
+

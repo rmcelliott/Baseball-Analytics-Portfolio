@@ -1,0 +1,231 @@
+---
+title: "An Exploration of Synth Saxophones Using the Frequency Domain"
+author: "Riley Elliott"
+date: "2024-05-02"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r, include=FALSE}
+require(astsa)
+library(audio)
+library(tuneR)
+library(signal)
+library(png)
+```
+
+# Introduction
+
+  In many ways, music is a very mathematical art. While a lot of things go into making music sound good in the subjective sense, we know that the thing that makes notes sound consonant or dissonant together is the relationship between the frequencies of the sound waves they create. More appropriately, the frequencies *represented* in the sound waves they create. Each note vibrates at multiple frequencies, which are referred to as the harmonic series. The "fundamental frequency" makes the strongest contribution to the sound wave, and a particular set of octaves, fifths, and thirds above it make progressively weaker contributions. 
+  
+  Each instrument is tuned differently--most notably, pianos and keyboards, which are tuned using the equal temperament system, which ensures that one can play in every key but only approximately in tune. Each instrument also has a slightly different harmonic series in that different overtone frequencies are represented at different strengths from instrument to instrument. With that in mind, my goal in this project is to create something of a synth saxophone by transforming the frequency structure of a time series produced by a keyboard, into something more akin to one produced by an alto saxophone. I'll just be doing for one note, to keep things simple.
+  
+  Here is the time series produced by a middle C on my keyboard.
+
+```{r, echo = FALSE}
+audio_file <- "/Users/relliott/Desktop/keys.wav"
+
+audio <- readWave(audio_file)
+x <- audio@left
+print(audio)
+
+plot.ts(x[45000:100000], type = "l", xlab = "Time", ylab = "Amplitude", main = "Middle C on Keyboard")
+```
+
+  I don't have a sustain pedal, so the volume noticeably fades throughout. This makes the time series non-stationary overall. We just need to look at a small enough time window in which the variance doesn't change too much to recover stationarity. 
+
+```{r, echo = FALSE}
+keys <- x[54001:56000]
+plot.ts(keys, type = "l", xlab = "Time", ylab = "Amplitude", main = "Middle C on Keyboard")
+```
+
+  We can see some distinct low frequency structure, and weaker high frequency structure. The time series seems to be very consistent, so there likely aren't many frequencies represented. This makes sense for a musical note--the more frequencies involved, the more muddy and dissonant it will sound. Now, let's plot the periodogram.
+
+```{r, echo = FALSE}
+keys_spec <- spec.pgram(keys, log = "no")
+```
+
+  Our suspicions are confirmed. We won't smooth this periodogram for the reasons mentioned above--there is no need to take a local average, because middle c is produced by a very particular combination of a few specific frequencies. 
+  
+  Now let's replicate these plots for the same note played on alto sax. 
+
+```{r, echo = FALSE}
+audio_file <- "/Users/relliott/Desktop/newsax.wav"
+
+audio <- readWave(audio_file)
+y <- audio@left
+print(audio)
+
+plot.ts(y, type = "l", xlab = "Time", ylab = "Amplitude", main = "Middle C on Alto Sax")
+```
+
+```{r, echo = FALSE}
+sax2 <- y[300001:305000]
+plot.ts(sax2, type = "l", xlab = "Time", ylab = "Amplitude", main = "Middle C on Alto Sax")
+```
+
+
+```{r, echo = FALSE}
+sax_spec <- spec.pgram(sax2, log = "no")
+```
+
+  The most notable difference is that the second harmonic, one octave up from the fundamental frequency, is very strongly represented. This might make sense in contrast to a keyboard, which is somewhat mechanical in its production of notes, and can more easily dampen the harmonic series than I can. There are more frequencies represented in general, both for this fact and because my pitch definitely wavered a little bit. I might have even snuck some vibrato in. Both would change the fundamental frequency, and therefore the harmonic series as well. 
+
+```{r, include = FALSE}
+sax3 <- y[300001:302000]
+plot.ts(sax3, type = "l", xlab = "Time", ylab = "Amplitude", main = "Middle C on Alto Sax")
+```
+
+
+```{r, echo = FALSE}
+# Calculate the spectral density estimate
+sax_spec2 <- spec.pgram(sax3, log = "no")
+```
+
+
+  We're going to reproduce the same spectrum, but with T = 2,000, to match that of the keyboard. This is necessary in order to do the following calculations, in which we attempt to turn $x_t$ into $y_t$ using a linear filter. 
+
+
+```{r, echo=FALSE}
+img <- readPNG("desktop/finalcalcs.png")
+grid::grid.raster(img)
+```
+
+
+```{r, echo = FALSE}
+y.hat2 <- Re(fft(sqrt(sax_spec2$spec / keys_spec$spec)[seq(1,1000,20)], inverse = TRUE))
+y.hat3 <- c(y.hat2[50:2], y.hat2)
+sax.fake <- c()
+for (i in 50:1950) {
+  sax.fake[i] <- sum(y.hat3 * keys[(i-49):(i+49)]) 
+}
+
+plot.ts(y.hat3)
+```
+
+  I've forced out the complex components of the results. It's pretty apparent from looking at this time series that it looks nothing like the alto sax time series. 
+  
+```{r}
+spec.pgram(y.hat3, log = "no")
+```
+
+  Looks like the assumptions underlying our calculations were incorrect. A different method is needed. 
+  
+  I'll attempt to recreate the alto saxophone time series entirely from scratch. In order to do this, I'll need to look through the spectral distribution of the alto to find the most prevalent frequencies and their corresponding strengths. I'll then create a composite waveform by adding cosines of these frequencies with properly weighted amplitudes. First, to find the frequencies.
+
+```{r, echo = FALSE}
+freq_list <- numeric()
+
+# Loop through frequencies and check power
+for (i in 1:length(sax_spec$freq)) {
+  if (sax_spec$spec[i] >= 1000000000) {
+    freq_list <- c(freq_list, sax_spec$freq[i])
+  }
+}
+
+print(freq_list)
+```
+
+  Here, we can see the fundamental frequency is around 0.0054. I kept lowering the minimum required power for a frequency to appear on this list until I could see the third, fifth, and octave were all represented. In most cases, each harmonic is accompanied by a few very similar frequencies, which was not the case with the very precise keyboard. We'll keep those, as they should help provide some sax-like tone. Let's find the corresponding powers of these frequencies. 
+
+```{r, echo = FALSE}
+# Initialize a list to store powers of frequencies in freq_list
+freq_power <- list()
+
+# Loop through sax_spec to find powers of frequencies in freq_list
+for (i in 1:length(sax_spec$freq)) {
+  if (sax_spec$freq[i] %in% freq_list) {
+    freq_power[[as.character(sax_spec$freq[i])]] <- sax_spec$spec[i]
+  }
+}
+
+# Output powers of frequencies in freq_list
+print(freq_power)
+```
+
+  Because the plot is of a spectral distribution, and the y axis expresses how much of the variance in the time series a given frequency explains, mapping power to cosine amplitude is simple. Power, or height, at a given frequency is $2\sigma_\omega^2$ (multiplied by two because the we scan over $\omega = [-1/2, 1/2]$ picking up variance). The amplitude of each cosine wave directly corresponds to how much variance it creates, so we'll set amplitude equal to $\sqrt(2)\sqrt(power_\omega)$ for each cosine wave. 
+  
+  All that remains is build the corresponding cosine waves and stitch them together into a single waveform. 
+
+```{r, echo = FALSE}
+composite_waveform <- numeric(2000)
+
+# Loop through frequencies in freq
+for (freq in freq_list) {
+  
+  # Calculate amplitude from corresponding power
+  power <- freq_power[[as.character(freq)]]
+  amplitude <- sqrt(2) * sqrt(power)
+  
+  # Generate and append cosine function
+  cosine <- amplitude * cos(2 * pi * freq * seq(0, 2000, length.out = 2000))
+  composite_waveform <- composite_waveform + cosine
+}
+
+plot.ts(seq(0, 2000, length.out = 2000), composite_waveform, type = "l", xlab = "Time", ylab = "Amplitude", main = "Fake Sax Composite Waveform")
+```
+
+
+```{r, echo = FALSE}
+# Initialize an empty vector to store the composite waveform
+composite_waveform <- numeric(10000)
+
+# Loop through frequencies in freq
+for (freq in freq_list) {
+
+  # Calculate amplitude from corresponding power
+  power <- freq_power[[as.character(freq)]]
+  amplitude <- sqrt(2) * sqrt(power)
+  
+  # Generate and append cosine function
+  cosine <- amplitude * cos(2 * pi * freq * seq(0, 10000, length.out = 10000))
+  composite_waveform <- composite_waveform + cosine
+}
+
+plot.ts(seq(0, 10000, length.out = 10000), composite_waveform, type = "l", xlab = "Time", ylab = "Amplitude", main = "Fake Sax Composite Waveform")
+```
+
+  It doesn't seem to look like the sax time series, but some of that is due to how consistent it is. That's a given, because my pitch is more inconsistent than that of the computer generated sound wave. That said, there does seem to be a wider range of frequencies represented than in the keyboard periodogram, which was one of the things we were trying to reproduce. Let's check the periodogram for the composite waveform. 
+  
+```{r}
+spec.pgram(composite_waveform, log = "no")
+```
+
+  We seem to have reproduced the spectral distribution very well! This looks exactly like the periodogram of the T = 5,000 sample of the sax series seen above. Regardless, the best test will be done by ear. I've generated a longer version of this time series and downloaded it as an audio file titled "finalfakesax.wav". 
+
+```{r, include = FALSE}
+# Initialize an empty vector to store the composite waveform
+composite_waveform <- numeric(100000)
+
+# Loop through frequencies in freq
+for (freq in freq_list) {
+
+  # Calculate amplitude from corresponding power
+  power <- freq_power[[as.character(freq)]]
+  amplitude <- sqrt(2) * sqrt(power)
+  
+  # Generate and append cosine function
+  cosine <- amplitude * cos(2 * pi * freq * seq(0, 100000, length.out = 100000))
+  composite_waveform <- composite_waveform + cosine
+}
+
+plot.ts(seq(0, 100000, length.out = 100000), composite_waveform, type = "l", xlab = "Time", ylab = "Amplitude", main = "Fake Sax Composite Waveform")
+```
+
+
+```{r, include = FALSE}
+max_value <- max(abs(composite_waveform))
+if (max_value > 0) {
+  composite_waveform <- composite_waveform * (32767 / max_value)
+}
+
+wave <- Wave(composite_waveform, samp.rate = 24000, bit=16)
+writeWave(wave, "fakesaxnew.wav")
+```
+
+  It's worth noting that some compression of the cosine waves had to be done in order to download it, and the pitch being right is somewhat subject to picking the right sampling rate. 
+  
+  However, the pitch sounds roughly right on average, and the tone sounds a little richer than that of the keyboard note. I do think I can hear the accentuated harmonics. There is also an extreme vibrato, which makes it sound not great. It is visible in the time series plot for the fake saxophone note--there is some very strong low frequency structure that you don't really see in the sax time series. I'm not totally sure where that comes from given the similarity between the periodograms for the sax and composite waveform, and how apparent it is in one compared to the other. I'm inclined to think that's there because of a sampling issue or some problem with the generation and concatenation of the cosines. 
+
+  If I were to continue, my next steps would be to generalize this process. Ideally, we could enter a keyboard note, find the fundamental frequency, and reproduce a new time series with the harmonic series of a saxophone building off of that given fundamental. 
